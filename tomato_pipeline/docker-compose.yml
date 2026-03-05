@@ -1,0 +1,38 @@
+services:
+  tomato-pipeline:
+    container_name: tomato-pipeline
+    build:
+      # Build context is the repo root so the Dockerfile can COPY both tomato_pipeline and the Fanuc helpers.
+      context: ..
+      dockerfile: tomato_pipeline/Dockerfile
+      args:
+        ROS_DISTRO: ${ROS_DISTRO:-humble}
+        INTERFACES_IMAGE: gigas/interfaces:${TAG:-dev}
+    networks:
+      - ros2_humble_net
+
+    # RealSense access
+    privileged: true
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+
+    environment:
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-42}"
+      REALSENSE_SERIAL_ID_D405: "${REALSENSE_SERIAL_ID_D405:-218622279985}"
+      D405_TF_FRAME: "${D405_TF_FRAME:-tool_d405_camera_origin}"
+      PIPELINE_DATA_ROOT: "${PIPELINE_DATA_ROOT:-/data}"
+      PIPELINE_TRIAL_NUM: "${PIPELINE_TRIAL_NUM:-1}"
+    # Dev-friendly: mount the pipeline code for live edits.
+    volumes:
+      - "./:/workspace/tomato_pipeline"
+      - "../data:/data"
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    # Runs the ROS2 node entrypoint from the ament_python package.
+    command: ros2 run tomato_pipeline pipeline_node
+
+networks:
+  ros2_humble_net:
+    external: true
+    name: ros2_humble_net

@@ -1,0 +1,526 @@
+"""
+Robot Harvesting Pipeline (MID-MARCH SCOPE)
+Far capture -> Far perception -> coarse XYZ -> robot approach move
+-> Close capture -> Close perception -> cutpoint XYZ.
+
+This module supports two execution styles:
+1) `HarvestPipelineRunner`: long-lived, efficient multi-run object.
+2) `run_pipeline(...)`: backward-compatible one-shot wrapper.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable
+
+import cv2
+import numpy as np
+
+from pipeline_app.non_ros2.stages.stage1_far_detector import FarDetector
+from pipeline_app.non_ros2.stages.stage2_pairing import Pairer
+from pipeline_app.non_ros2.stages.stage3_ripeness import RipenessStage
+from pipeline_app.non_ros2.stages.stage5_close_robot import ClosePerceptionRobotStage
+from pipeline_app.non_ros2.vision.camera import Camera
+from pipeline_app.ros2.robot_client import RobotClientROS2
+
+
+class PipelineRunStatus:
+    SUCCESS = "SUCCESS"
+    NO_RIPE_TARGET = "NO_RIPE_TARGET"
+    INVALID_FAR_DEPTH = "INVALID_FAR_DEPTH"
+    MOTION_FAILED = "MOTION_FAILED"
+    CLOSE_DETECTION_FAILED = "CLOSE_DETECTION_FAILED"
+    INVALID_CUT_DEPTH = "INVALID_CUT_DEPTH"
+
+
+@dataclass(frozen=True)
+class PipelineRunResult:
+    status: str
+    message: str
+    timestamp: float
+    run_id: int | None = None
+    cluster_bbox: tuple[int, int, int, int] | None = None
+    cut_point: tuple[float, float] | None = None
+    coarse_xyz_cam: tuple[float, float, float] | None = None
+    cut_xyz_cam: tuple[float, float, float] | None = None
+    run_json_path: str | None = None
+    output_dir: str | None = None
+
+
+# -------------------------
+# Depth + Projection Helpers
+# -------------------------
+
+def depth_at(depth_img, u, v, win=7, invalid=0, scale=1.0):
+    """
+    Robust depth sampling: take a small window around (u,v), filter invalid/zero,
+    return median depth * scale.
+    """
+    height, width = depth_img.shape[:2]
+    u, v = int(round(u)), int(round(v))
+    radius = win // 2
+    x1, x2 = max(0, u - radius), min(width, u + radius + 1)
+    y1, y2 = max(0, v - radius), min(height, v + radius + 1)
+
+    patch = depth_img[y1:y2, x1:x2].astype(np.float32).reshape(-1)
+    patch = patch[(patch != invalid) & (patch > 0)]
+    if patch.size == 0:
+        return None
+
+    return float(np.median(patch)) * scale
+
+
+def uvz_to_xyz(u, v, z, fx, fy, cx, cy):
+    """
+    Pinhole back-projection: (u,v,z) -> (x,y,z) in CAMERA frame.
+    Units: z should be in meters (after applying depth_scale).
+    """
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    return x, y, z
+
+
+def _to_serializable(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable(v) for v in value]
+    return str(value)
+
+
+class HarvestPipelineRunner:
+    """Long-lived runner that keeps heavy resources initialized across runs."""
+
+    def __init__(self, log: Callable[[str], None] = print):
+        self.log = log
+        self._closed = False
+        self.robot = None
+        self.camera = None
+        self.detector = None
+        self.pairer = None
+        self.ripeness = None
+        self.close_stage = None
+        self.run_counter = 0
+
+        self.project_root = Path(__file__).resolve().parents[2]
+
+        model_dir = self.project_root / "models"
+        far_model = str(model_dir / "yolo_far.pt")
+        seg_model = str(model_dir / "seg_best.pt")
+        cls_model = str(model_dir / "mobilenetv2_best.pt")
+        close_model = str(model_dir / "yolo_close.pt")
+
+        # Motion/configuration defaults. Can be overridden via env.
+        self.standoff_m = float(os.environ.get("PIPELINE_STANDOFF_M", "0.20"))
+        self.move_vel = int(os.environ.get("PIPELINE_MOVE_VEL", "40"))
+        self.move_acc = int(os.environ.get("PIPELINE_MOVE_ACC", "10"))
+        self.move_timeout = float(os.environ.get("PIPELINE_MOVE_TIMEOUT_S", "30.0"))
+        self.warmup_frames = int(os.environ.get("PIPELINE_CAMERA_WARMUP_FRAMES", "20"))
+
+        # Output organization defaults.
+        self.data_root = Path(os.environ.get("PIPELINE_DATA_ROOT", "/data"))
+        self.trial_num = str(os.environ.get("PIPELINE_TRIAL_NUM", "1")).strip() or "1"
+
+        # SG2 URDF D405 frame (default aligns with gigas-superproject semantics).
+        self.camera_frame = os.environ.get("D405_TF_FRAME", "tool_d405_camera_origin").strip()
+        if not self.camera_frame:
+            raise ValueError("D405_TF_FRAME must be non-empty if provided.")
+
+        try:
+            init_t0 = time.time()
+            self.log("[init] Initializing long-lived pipeline resources...")
+
+            # Initialize heavy resources once.
+            self.robot = RobotClientROS2()
+            self.camera = Camera()
+            self.detector = FarDetector(far_model)
+            self.pairer = Pairer(cluster_cls="c", peduncle_cls="p")
+            self.ripeness = RipenessStage(
+                seg_weights_path=seg_model,
+                cls_ckpt_path=cls_model,
+                imgsz=320,
+                conf_seg=0.30,
+            )
+            self.close_stage = ClosePerceptionRobotStage(
+                model_path=close_model,
+                imgsz=768,
+            )
+
+            self.log(f"[init] Using RealSense D405 serial: {self.camera.serial}")
+            self.log(f"[init] Using D405 TF frame: {self.camera_frame}")
+
+            # Warm up camera once for exposure/depth stabilization.
+            self.log(f"[init] Warming camera for {self.warmup_frames} frames...")
+            for _ in range(self.warmup_frames):
+                self.camera.get_frames()
+
+            intrinsics = self.camera.get_intrinsics()
+            self.fx, self.fy, self.cx, self.cy = (
+                intrinsics.fx,
+                intrinsics.fy,
+                intrinsics.cx,
+                intrinsics.cy,
+            )
+            self.log(
+                "[init] Camera intrinsics (from active stream): "
+                f"fx={self.fx:.3f}, fy={self.fy:.3f}, cx={self.cx:.3f}, cy={self.cy:.3f}, "
+                f"width={intrinsics.width}, height={intrinsics.height}"
+            )
+            self.log(f"[init] Resource initialization completed in {time.time() - init_t0:.2f}s")
+        except Exception:
+            self.close()
+            raise
+
+    def _save_image(self, path: Path, image: np.ndarray):
+        ok = cv2.imwrite(str(path), image)
+        if not ok:
+            self.log(f"[warn] Failed to save image: {path}")
+        return ok
+
+    def _annotate_stage1(self, frame: np.ndarray, detections):
+        out = frame.copy()
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox
+            color = (0, 255, 0) if det.cls.lower().startswith("c") else (0, 165, 255)
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            label = f"{det.cls}:{det.conf:.2f}"
+            cv2.putText(out, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        return out
+
+    def _annotate_stage2(self, frame: np.ndarray, pairs):
+        out = frame.copy()
+        for idx, pair in enumerate(pairs):
+            cx1, cy1, cx2, cy2 = pair.cluster.bbox
+            px1, py1, px2, py2 = pair.peduncle.bbox
+            cv2.rectangle(out, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
+            cv2.rectangle(out, (px1, py1), (px2, py2), (0, 165, 255), 2)
+            ccx, ccy = int(0.5 * (cx1 + cx2)), int(0.5 * (cy1 + cy2))
+            pcx, pcy = int(0.5 * (px1 + px2)), int(0.5 * (py1 + py2))
+            cv2.line(out, (ccx, ccy), (pcx, pcy), (255, 255, 0), 2)
+            text = f"pair{idx} {pair.match_type} d={pair.center_dist_px:.1f}"
+            cv2.putText(out, text, (px1, max(20, py1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2, cv2.LINE_AA)
+        return out
+
+    def _annotate_stage3(self, frame: np.ndarray, results, chosen_idx: int | None):
+        out = frame.copy()
+        for idx, res in enumerate(results):
+            if res.cluster_bbox is None:
+                continue
+            x1, y1, x2, y2 = res.cluster_bbox
+            is_chosen = chosen_idx is not None and idx == chosen_idx
+            color = (0, 255, 0) if is_chosen else (255, 200, 0)
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            label = f"{res.ripeness}:{res.ripeness_conf:.2f}"
+            if is_chosen:
+                label += " [chosen]"
+            cv2.putText(out, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        return out
+
+    def _annotate_stage5(self, frame: np.ndarray, close_out):
+        out = frame.copy()
+        if close_out.cluster_bbox is not None:
+            x1, y1, x2, y2 = close_out.cluster_bbox
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        if close_out.pedicel_bbox is not None:
+            x1, y1, x2, y2 = close_out.pedicel_bbox
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 165, 255), 2)
+        for i, point in enumerate(close_out.keypoints):
+            px, py = int(point[0]), int(point[1])
+            cv2.circle(out, (px, py), 4, (255, 255, 255), -1)
+            cv2.putText(out, f"k{i}", (px + 6, py - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        if close_out.cut_point is not None:
+            cx, cy = int(close_out.cut_point[0]), int(close_out.cut_point[1])
+            cv2.circle(out, (cx, cy), 7, (0, 0, 255), -1)
+            cv2.putText(out, "cut", (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        return out
+
+    def _prepare_output_paths(self, run_id: int, run_timestamp: float):
+        cur_date = datetime.utcnow().strftime("%Y-%m-%d")
+        parent_dir = self.data_root / cur_date / self.trial_num
+        images_dir = parent_dir / "images"
+        labelled_dir = parent_dir / "labelled_images"
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        images_dir.mkdir(parents=True, exist_ok=True)
+        labelled_dir.mkdir(parents=True, exist_ok=True)
+
+        base = f"harvest{run_id}_d405_{run_timestamp:.4f}"
+        return {
+            "parent_dir": parent_dir,
+            "images_dir": images_dir,
+            "labelled_dir": labelled_dir,
+            "far_rgb": images_dir / f"{base}_far_rgb.jpg",
+            "far_depth": images_dir / f"{base}_far_depth.png",
+            "close_rgb": images_dir / f"{base}_close_rgb.jpg",
+            "close_depth": images_dir / f"{base}_close_depth.png",
+            "ann_stage1": labelled_dir / f"{base}_stage1_detections.jpg",
+            "ann_stage2": labelled_dir / f"{base}_stage2_pairs.jpg",
+            "ann_stage3": labelled_dir / f"{base}_stage3_ripeness.jpg",
+            "ann_stage5": labelled_dir / f"{base}_stage5_close_perception.jpg",
+        }
+
+    def _write_run_json(self, parent_dir: Path, run_id: int, run_payload: dict):
+        ts_str = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S") + " UTC"
+        json_path = parent_dir / f"trial-{self.trial_num}-pipeline-run{run_id}-{ts_str}.json"
+        with open(json_path, "w", encoding="utf-8") as outfile:
+            json.dump(_to_serializable(run_payload), outfile, indent=4)
+        return json_path
+
+    def run_once(self) -> PipelineRunResult:
+        if self._closed:
+            raise RuntimeError("HarvestPipelineRunner is closed.")
+
+        self.run_counter += 1
+        run_id = self.run_counter
+        run_start = time.time()
+        run_start_utc = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S UTC")
+
+        output_paths = self._prepare_output_paths(run_id=run_id, run_timestamp=run_start)
+        run_payload = {
+            "run_id": run_id,
+            "start_time_utc": run_start_utc,
+            "config": {
+                "camera_frame": self.camera_frame,
+                "standoff_m": self.standoff_m,
+                "move_vel": self.move_vel,
+                "move_acc": self.move_acc,
+                "move_timeout_s": self.move_timeout,
+                "trial_num": self.trial_num,
+                "data_root": str(self.data_root),
+            },
+            "stages": {},
+            "artifacts": {
+                "far_rgb": str(output_paths["far_rgb"]),
+                "far_depth": str(output_paths["far_depth"]),
+                "close_rgb": str(output_paths["close_rgb"]),
+                "close_depth": str(output_paths["close_depth"]),
+                "ann_stage1": str(output_paths["ann_stage1"]),
+                "ann_stage2": str(output_paths["ann_stage2"]),
+                "ann_stage3": str(output_paths["ann_stage3"]),
+                "ann_stage5": str(output_paths["ann_stage5"]),
+            },
+        }
+
+        self.log(f"[run {run_id}] Starting pipeline run")
+
+        def _finalize(status: str, message: str, **extra):
+            run_payload["status"] = status
+            run_payload["message"] = message
+            run_payload["end_time_utc"] = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S UTC")
+            run_payload["duration_s"] = round(time.time() - run_start, 4)
+            run_payload.update(extra)
+            json_path = self._write_run_json(output_paths["parent_dir"], run_id, run_payload)
+            self.log(f"[run {run_id}] Completed with status={status}. JSON: {json_path}")
+            return PipelineRunResult(
+                status=status,
+                message=message,
+                timestamp=run_start,
+                run_id=run_id,
+                cluster_bbox=extra.get("cluster_bbox"),
+                cut_point=extra.get("cut_point"),
+                coarse_xyz_cam=extra.get("coarse_xyz_cam"),
+                cut_xyz_cam=extra.get("cut_xyz_cam"),
+                run_json_path=str(json_path),
+                output_dir=str(output_paths["parent_dir"]),
+            )
+
+        # FAR CAPTURE
+        stage_t0 = time.time()
+        self.log(f"[run {run_id}] Stage FAR capture")
+        rgb_far, depth_far = self.camera.get_frames()
+        self._save_image(output_paths["far_rgb"], rgb_far)
+        self._save_image(output_paths["far_depth"], depth_far)
+        run_payload["stages"]["far_capture"] = {
+            "duration_s": round(time.time() - stage_t0, 4),
+            "rgb_path": str(output_paths["far_rgb"]),
+            "depth_path": str(output_paths["far_depth"]),
+        }
+
+        # FAR DETECTION + PAIRING + RIPENESS
+        stage_t0 = time.time()
+        detections = self.detector.run(rgb_far)
+        self._save_image(output_paths["ann_stage1"], self._annotate_stage1(rgb_far, detections))
+        self.log(f"[run {run_id}] Stage 1 detections: {len(detections)}")
+
+        pairs = self.pairer.run(detections, rgb_far.shape[:2])
+        self._save_image(output_paths["ann_stage2"], self._annotate_stage2(rgb_far, pairs))
+        self.log(f"[run {run_id}] Stage 2 pairs: {len(pairs)}")
+
+        results = self.ripeness.run(rgb_far, pairs)
+        ripe_indices = [i for i, result in enumerate(results) if result.ripeness == "ripe"]
+        chosen_idx = ripe_indices[0] if ripe_indices else None
+        self._save_image(output_paths["ann_stage3"], self._annotate_stage3(rgb_far, results, chosen_idx))
+        self.log(
+            f"[run {run_id}] Stage 3 ripeness results: total={len(results)}, ripe={len(ripe_indices)}"
+        )
+
+        run_payload["stages"]["far_perception"] = {
+            "duration_s": round(time.time() - stage_t0, 4),
+            "num_detections": len(detections),
+            "num_pairs": len(pairs),
+            "num_ripeness_results": len(results),
+            "num_ripe": len(ripe_indices),
+        }
+
+        if not ripe_indices:
+            return _finalize(
+                PipelineRunStatus.NO_RIPE_TARGET,
+                "No ripe clusters detected.",
+            )
+
+        chosen_target = results[chosen_idx]
+        if chosen_target.cluster_bbox is None:
+            return _finalize(
+                PipelineRunStatus.NO_RIPE_TARGET,
+                "Chosen ripe target is missing cluster bbox.",
+            )
+
+        # FAR COARSE XYZ
+        x1, y1, x2, y2 = chosen_target.cluster_bbox
+        u_far = 0.5 * (x1 + x2)
+        v_far = 0.5 * (y1 + y2)
+        z_far = depth_at(depth_far, u_far, v_far, scale=self.camera.depth_scale)
+        if z_far is None:
+            return _finalize(
+                PipelineRunStatus.INVALID_FAR_DEPTH,
+                "Invalid depth at FAR bbox center.",
+                cluster_bbox=chosen_target.cluster_bbox,
+            )
+
+        coarse_xyz_cam = uvz_to_xyz(u_far, v_far, z_far, self.fx, self.fy, self.cx, self.cy)
+        run_payload["stages"]["far_target"] = {
+            "bbox_center_uv": [u_far, v_far],
+            "depth_m": z_far,
+            "coarse_xyz_cam_m": coarse_xyz_cam,
+        }
+        self.log(f"[run {run_id}] FAR coarse XYZ_cam: {coarse_xyz_cam}")
+
+        # ROBOT MOVE
+        stage_t0 = time.time()
+        approach_xyz_cam = (
+            coarse_xyz_cam[0],
+            coarse_xyz_cam[1],
+            coarse_xyz_cam[2] - self.standoff_m,
+        )
+        self.log(f"[run {run_id}] Robot approach target XYZ_cam: {approach_xyz_cam}")
+        ok = self.robot.move_xyz_cam_to_tool(
+            xyz_cam=approach_xyz_cam,
+            camera_frame=self.camera_frame,
+            tool_frame=self.camera_frame,
+            velocity=self.move_vel,
+            acceleration=self.move_acc,
+            timeout_sec=self.move_timeout,
+        )
+        run_payload["stages"]["robot_move"] = {
+            "duration_s": round(time.time() - stage_t0, 4),
+            "approach_xyz_cam_m": approach_xyz_cam,
+            "success": bool(ok),
+        }
+        if not ok:
+            return _finalize(
+                PipelineRunStatus.MOTION_FAILED,
+                "Robot motion failed.",
+                cluster_bbox=chosen_target.cluster_bbox,
+                coarse_xyz_cam=coarse_xyz_cam,
+            )
+
+        # CLOSE CAPTURE
+        stage_t0 = time.time()
+        self.log(f"[run {run_id}] Stage CLOSE capture")
+        rgb_close, depth_close = self.camera.get_frames()
+        self._save_image(output_paths["close_rgb"], rgb_close)
+        self._save_image(output_paths["close_depth"], depth_close)
+        run_payload["stages"]["close_capture"] = {
+            "duration_s": round(time.time() - stage_t0, 4),
+            "rgb_path": str(output_paths["close_rgb"]),
+            "depth_path": str(output_paths["close_depth"]),
+        }
+
+        # CLOSE PERCEPTION
+        stage_t0 = time.time()
+        close_out = self.close_stage.run(rgb_close)
+        self._save_image(output_paths["ann_stage5"], self._annotate_stage5(rgb_close, close_out))
+        run_payload["stages"]["close_perception"] = {
+            "duration_s": round(time.time() - stage_t0, 4),
+            "detection_success": bool(close_out.detection_success),
+            "cluster_bbox": close_out.cluster_bbox,
+            "pedicel_bbox": close_out.pedicel_bbox,
+            "cut_point": close_out.cut_point,
+            "keypoints": close_out.keypoints,
+            "debug_info": close_out.debug_info,
+        }
+
+        if not close_out.detection_success or close_out.cut_point is None:
+            return _finalize(
+                PipelineRunStatus.CLOSE_DETECTION_FAILED,
+                "Close perception failed to return a valid cutpoint.",
+                cluster_bbox=chosen_target.cluster_bbox,
+                coarse_xyz_cam=coarse_xyz_cam,
+            )
+
+        # CUTPOINT XYZ
+        u_cut, v_cut = close_out.cut_point
+        z_cut = depth_at(depth_close, u_cut, v_cut, scale=self.camera.depth_scale)
+        if z_cut is None:
+            return _finalize(
+                PipelineRunStatus.INVALID_CUT_DEPTH,
+                "Invalid depth at cutpoint.",
+                cluster_bbox=chosen_target.cluster_bbox,
+                cut_point=close_out.cut_point,
+                coarse_xyz_cam=coarse_xyz_cam,
+            )
+
+        cut_xyz_cam = uvz_to_xyz(u_cut, v_cut, z_cut, self.fx, self.fy, self.cx, self.cy)
+        run_payload["stages"]["cutpoint"] = {
+            "cut_uv": [u_cut, v_cut],
+            "cut_depth_m": z_cut,
+            "cut_xyz_cam_m": cut_xyz_cam,
+        }
+        self.log(f"[run {run_id}] Cutpoint XYZ_cam: {cut_xyz_cam}")
+
+        return _finalize(
+            PipelineRunStatus.SUCCESS,
+            "Pipeline run completed successfully.",
+            cluster_bbox=chosen_target.cluster_bbox,
+            cut_point=close_out.cut_point,
+            coarse_xyz_cam=coarse_xyz_cam,
+            cut_xyz_cam=cut_xyz_cam,
+        )
+
+    def close(self):
+        if self._closed:
+            return
+
+        self._closed = True
+        if self.camera is not None:
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
+
+        if self.robot is not None:
+            try:
+                self.robot.destroy_node()
+            except Exception:
+                pass
+
+
+def run_pipeline(log=print):
+    """
+    Backward-compatible one-shot wrapper used by older call sites/tools.
+    """
+    runner = HarvestPipelineRunner(log=log)
+    try:
+        return runner.run_once()
+    finally:
+        runner.close()
