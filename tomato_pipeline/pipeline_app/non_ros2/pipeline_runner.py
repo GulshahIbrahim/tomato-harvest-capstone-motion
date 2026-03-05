@@ -21,7 +21,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from pipeline_app.non_ros2.stages.stage1_far_detector import FarDetector
+from pipeline_app.non_ros2.stages.stage1_far_detector import FarDetector, Detection
 from pipeline_app.non_ros2.stages.stage2_pairing import Pairer
 from pipeline_app.non_ros2.stages.stage3_ripeness import RipenessStage
 from pipeline_app.non_ros2.stages.stage5_close_robot import ClosePerceptionRobotStage
@@ -102,8 +102,12 @@ def _to_serializable(value):
 class HarvestPipelineRunner:
     """Long-lived runner that keeps heavy resources initialized across runs."""
 
-    def __init__(self, log: Callable[[str], None] = print):
+    def __init__(self, log: Callable[[str], None] = print, interactive: bool = None):
         self.log = log
+        if interactive is None:
+            self.interactive = os.environ.get("PIPELINE_INTERACTIVE", "false").lower() in ("true", "1", "yes")
+        else:
+            self.interactive = interactive
         self._closed = False
         self.robot = None
         self.camera = None
@@ -188,15 +192,83 @@ class HarvestPipelineRunner:
             self.log(f"[warn] Failed to save image: {path}")
         return ok
 
-    def _annotate_stage1(self, frame: np.ndarray, detections):
-        out = frame.copy()
-        for det in detections:
-            x1, y1, x2, y2 = det.bbox
-            color = (0, 255, 0) if det.cls.lower().startswith("c") else (0, 165, 255)
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            label = f"{det.cls}:{det.conf:.2f}"
-            cv2.putText(out, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-        return out
+    def _confirm_detections(self, frame: np.ndarray, detections, stage_name: str) -> tuple[bool, list]:
+        """Display detections and wait for user confirmation. Returns (proceed, updated_detections)."""
+        if not self.interactive:
+            return True, detections
+        
+        while True:
+            annotated = self._annotate_stage1(frame, detections)
+            cv2.imshow(f"Confirm {stage_name} Detections", annotated)
+            self.log(f"[interactive] Confirming {stage_name} detections. Press 'y' to proceed, 'n' to skip run, 'e' to edit.")
+            key = cv2.waitKey(0) & 0xFF
+            if key == ord('y'):
+                cv2.destroyWindow(f"Confirm {stage_name} Detections")
+                return True, detections
+            elif key == ord('n'):
+                cv2.destroyWindow(f"Confirm {stage_name} Detections")
+                return False, detections
+            elif key == ord('e'):
+                cv2.destroyWindow(f"Confirm {stage_name} Detections")
+                detections = self._edit_detections(frame, detections)
+                # Loop back to confirm again
+            else:
+                continue
+        return True, detections
+
+    def _edit_detections(self, frame: np.ndarray, detections) -> list:
+        """Allow user to add manual detections by drawing boxes."""
+        self.log("[interactive] Edit mode: Click and drag to draw a box, then press 'c' for cluster or 'p' for peduncle to add. Press 'd' when done.")
+        
+        drawing = False
+        start_point = None
+        end_point = None
+        temp_frame = self._annotate_stage1(frame, detections).copy()
+        
+        def mouse_callback(event, x, y, flags, param):
+            nonlocal drawing, start_point, end_point, temp_frame
+            if event == cv2.EVENT_LBUTTONDOWN:
+                drawing = True
+                start_point = (x, y)
+            elif event == cv2.EVENT_MOUSEMOVE:
+                if drawing:
+                    temp_frame = self._annotate_stage1(frame, detections).copy()
+                    cv2.rectangle(temp_frame, start_point, (x, y), (255, 0, 0), 2)
+            elif event == cv2.EVENT_LBUTTONUP:
+                drawing = False
+                end_point = (x, y)
+                temp_frame = self._annotate_stage1(frame, detections).copy()
+                cv2.rectangle(temp_frame, start_point, end_point, (255, 0, 0), 2)
+        
+        cv2.namedWindow("Edit Detections")
+        cv2.setMouseCallback("Edit Detections", mouse_callback)
+        
+        while True:
+            cv2.imshow("Edit Detections", temp_frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('c') and start_point and end_point:
+                x1, y1 = start_point
+                x2, y2 = end_point
+                bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+                detections.append(Detection(cls="cluster", conf=1.0, bbox=bbox))
+                self.log(f"[interactive] Added cluster: {bbox}")
+                start_point = None
+                end_point = None
+                temp_frame = self._annotate_stage1(frame, detections).copy()
+            elif key == ord('p') and start_point and end_point:
+                x1, y1 = start_point
+                x2, y2 = end_point
+                bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+                detections.append(Detection(cls="peduncle", conf=1.0, bbox=bbox))
+                self.log(f"[interactive] Added peduncle: {bbox}")
+                start_point = None
+                end_point = None
+                temp_frame = self._annotate_stage1(frame, detections).copy()
+            elif key == ord('d'):
+                break
+        
+        cv2.destroyWindow("Edit Detections")
+        return detections
 
     def _annotate_stage2(self, frame: np.ndarray, pairs):
         out = frame.copy()
@@ -349,10 +421,21 @@ class HarvestPipelineRunner:
         # FAR DETECTION + PAIRING + RIPENESS
         stage_t0 = time.time()
         detections = self.detector.run(rgb_far)
+        proceed, detections = self._confirm_detections(rgb_far, detections, "Stage 1")
+        if not proceed:
+            return _finalize(
+                PipelineRunStatus.NO_RIPE_TARGET,
+                "User rejected detections.",
+            )
         self._save_image(output_paths["ann_stage1"], self._annotate_stage1(rgb_far, detections))
         self.log(f"[run {run_id}] Stage 1 detections: {len(detections)}")
 
         pairs = self.pairer.run(detections, rgb_far.shape[:2])
+        if not self._confirm_pairs(rgb_far, pairs, "Stage 2"):
+            return _finalize(
+                PipelineRunStatus.NO_RIPE_TARGET,
+                "User rejected pairs.",
+            )
         self._save_image(output_paths["ann_stage2"], self._annotate_stage2(rgb_far, pairs))
         self.log(f"[run {run_id}] Stage 2 pairs: {len(pairs)}")
 
@@ -515,11 +598,11 @@ class HarvestPipelineRunner:
                 pass
 
 
-def run_pipeline(log=print):
+def run_pipeline(log=print, interactive=False):
     """
     Backward-compatible one-shot wrapper used by older call sites/tools.
     """
-    runner = HarvestPipelineRunner(log=log)
+    runner = HarvestPipelineRunner(log=log, interactive=interactive)
     try:
         return runner.run_once()
     finally:
