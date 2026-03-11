@@ -23,6 +23,11 @@ if [ -f "${ENV_FILE}" ]; then
   set +a
 fi
 
+# Allow the container to open OpenCV GUI windows on the local X server.
+if [ -n "${DISPLAY:-}" ] && command -v xhost >/dev/null 2>&1; then
+  xhost +local:root >/dev/null 2>&1 || true
+fi
+
 # Ensure the shared ROS2 bridge network exists (used by both compose projects).
 if ! docker network inspect "${ROS2_NETWORK}" >/dev/null 2>&1; then
   docker network create "${ROS2_NETWORK}" >/dev/null

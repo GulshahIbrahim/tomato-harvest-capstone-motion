@@ -22,10 +22,14 @@ services:
       D405_TF_FRAME: "${D405_TF_FRAME:-tool_d405_camera_origin}"
       PIPELINE_DATA_ROOT: "${PIPELINE_DATA_ROOT:-/data}"
       PIPELINE_TRIAL_NUM: "${PIPELINE_TRIAL_NUM:-1}"
+      PIPELINE_INTERACTIVE: "${PIPELINE_INTERACTIVE:-true}"
+      DISPLAY: "${DISPLAY:-}"
+      QT_X11_NO_MITSHM: "1"
     # Dev-friendly: mount the pipeline code for live edits.
     volumes:
       - "./:/workspace/tomato_pipeline"
       - "../data:/data"
+      - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
     stdin_open: true
     tty: true
     restart: unless-stopped

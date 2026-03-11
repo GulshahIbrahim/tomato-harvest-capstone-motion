@@ -108,6 +108,10 @@ class HarvestPipelineRunner:
             self.interactive = os.environ.get("PIPELINE_INTERACTIVE", "false").lower() in ("true", "1", "yes")
         else:
             self.interactive = interactive
+        self.gui_available = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        if self.interactive and not self.gui_available:
+            self.log("[init] PIPELINE_INTERACTIVE is enabled but no DISPLAY/WAYLAND_DISPLAY is available. Falling back to non-interactive mode.")
+            self.interactive = False
         self._closed = False
         self.robot = None
         self.camera = None
@@ -149,7 +153,12 @@ class HarvestPipelineRunner:
             self.robot = RobotClientROS2()
             self.camera = Camera()
             self.detector = FarDetector(far_model)
-            self.pairer = Pairer(cluster_cls="c", peduncle_cls="p")
+            self.cluster_cls_name = "c"
+            self.peduncle_cls_name = "p"
+            self.pairer = Pairer(
+                cluster_cls=self.cluster_cls_name,
+                peduncle_cls=self.peduncle_cls_name,
+            )
             self.ripeness = RipenessStage(
                 seg_weights_path=seg_model,
                 cls_ckpt_path=cls_model,
@@ -188,21 +197,77 @@ class HarvestPipelineRunner:
 
     def _save_image(self, path: Path, image: np.ndarray):
         ok = cv2.imwrite(str(path), image)
-        if not ok:
+        if ok:
+            self.log(f"[artifact] Saved image: {path}")
+        else:
             self.log(f"[warn] Failed to save image: {path}")
         return ok
 
+    def _normalize_detection_cls(self, cls_name: str) -> str:
+        cls_norm = str(cls_name).strip().lower()
+        if cls_norm in ("c", "cluster"):
+            return self.cluster_cls_name
+        if cls_norm in ("p", "peduncle", "pedicel"):
+            return self.peduncle_cls_name
+        return cls_norm
+
+    def _annotate_stage1(self, frame: np.ndarray, detections):
+        out = frame.copy()
+        for idx, detection in enumerate(detections):
+            x1, y1, x2, y2 = detection.bbox
+            cls_norm = self._normalize_detection_cls(detection.cls)
+            if cls_norm == self.cluster_cls_name:
+                color = (0, 255, 0)
+                cls_text = "cluster"
+            elif cls_norm == self.peduncle_cls_name:
+                color = (0, 165, 255)
+                cls_text = "peduncle"
+            else:
+                color = (200, 200, 200)
+                cls_text = str(detection.cls)
+
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            label = f"{cls_text}#{idx} {float(detection.conf):.2f}"
+            cv2.putText(
+                out,
+                label,
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+        return out
+
     def _confirm_detections(self, frame: np.ndarray, detections, stage_name: str) -> tuple[bool, list]:
         """Display detections and wait for user confirmation. Returns (proceed, updated_detections)."""
+        for detection in detections:
+            detection.cls = self._normalize_detection_cls(detection.cls)
+
         if not self.interactive:
             return True, detections
-        
+
+        if not detections:
+            self.log("[interactive] No Stage 1 detections found. Opening edit mode so you can draw manual boxes.")
+            detections = self._edit_detections(frame, detections)
+            for detection in detections:
+                detection.cls = self._normalize_detection_cls(detection.cls)
+
         while True:
             annotated = self._annotate_stage1(frame, detections)
             cv2.imshow(f"Confirm {stage_name} Detections", annotated)
             self.log(f"[interactive] Confirming {stage_name} detections. Press 'y' to proceed, 'n' to skip run, 'e' to edit.")
             key = cv2.waitKey(0) & 0xFF
             if key == ord('y'):
+                has_cluster = any(detection.cls == self.cluster_cls_name for detection in detections)
+                has_peduncle = any(detection.cls == self.peduncle_cls_name for detection in detections)
+                if not (has_cluster and has_peduncle):
+                    self.log(
+                        "[interactive] Need at least one cluster and one peduncle box to continue. "
+                        "Press 'e' to add missing boxes."
+                    )
+                    continue
                 cv2.destroyWindow(f"Confirm {stage_name} Detections")
                 return True, detections
             elif key == ord('n'):
@@ -250,7 +315,7 @@ class HarvestPipelineRunner:
                 x1, y1 = start_point
                 x2, y2 = end_point
                 bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-                detections.append(Detection(cls="cluster", conf=1.0, bbox=bbox))
+                detections.append(Detection(cls=self.cluster_cls_name, conf=1.0, bbox=bbox))
                 self.log(f"[interactive] Added cluster: {bbox}")
                 start_point = None
                 end_point = None
@@ -259,7 +324,7 @@ class HarvestPipelineRunner:
                 x1, y1 = start_point
                 x2, y2 = end_point
                 bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-                detections.append(Detection(cls="peduncle", conf=1.0, bbox=bbox))
+                detections.append(Detection(cls=self.peduncle_cls_name, conf=1.0, bbox=bbox))
                 self.log(f"[interactive] Added peduncle: {bbox}")
                 start_point = None
                 end_point = None
@@ -269,6 +334,23 @@ class HarvestPipelineRunner:
         
         cv2.destroyWindow("Edit Detections")
         return detections
+
+    def _confirm_pairs(self, frame: np.ndarray, pairs, stage_name: str) -> bool:
+        if not self.interactive:
+            return True
+
+        window_name = f"Confirm {stage_name} Pairs"
+        while True:
+            annotated = self._annotate_stage2(frame, pairs)
+            cv2.imshow(window_name, annotated)
+            self.log(f"[interactive] Confirming {stage_name} pairs. Press 'y' to proceed or 'n' to skip run.")
+            key = cv2.waitKey(0) & 0xFF
+            if key == ord('y'):
+                cv2.destroyWindow(window_name)
+                return True
+            if key == ord('n'):
+                cv2.destroyWindow(window_name)
+                return False
 
     def _annotate_stage2(self, frame: np.ndarray, pairs):
         out = frame.copy()
@@ -358,6 +440,7 @@ class HarvestPipelineRunner:
         run_start_utc = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S UTC")
 
         output_paths = self._prepare_output_paths(run_id=run_id, run_timestamp=run_start)
+        self.log(f"[run {run_id}] Artifacts directory: {output_paths['parent_dir']}")
         run_payload = {
             "run_id": run_id,
             "start_time_utc": run_start_utc,
@@ -431,6 +514,16 @@ class HarvestPipelineRunner:
         self.log(f"[run {run_id}] Stage 1 detections: {len(detections)}")
 
         pairs = self.pairer.run(detections, rgb_far.shape[:2])
+        while self.interactive and not pairs:
+            self.log("[interactive] Stage 2 could not form any pairs. Returning to Stage 1 confirm/edit.")
+            proceed, detections = self._confirm_detections(rgb_far, detections, "Stage 1")
+            if not proceed:
+                return _finalize(
+                    PipelineRunStatus.NO_RIPE_TARGET,
+                    "User rejected detections.",
+                )
+            pairs = self.pairer.run(detections, rgb_far.shape[:2])
+
         if not self._confirm_pairs(rgb_far, pairs, "Stage 2"):
             return _finalize(
                 PipelineRunStatus.NO_RIPE_TARGET,

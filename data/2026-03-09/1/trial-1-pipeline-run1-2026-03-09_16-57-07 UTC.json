@@ -1,0 +1,41 @@
+{
+    "run_id": 1,
+    "start_time_utc": "2026-03-09_16-57-07 UTC",
+    "config": {
+        "camera_frame": "tool_d405_camera_origin",
+        "standoff_m": 0.2,
+        "move_vel": 40,
+        "move_acc": 10,
+        "move_timeout_s": 30.0,
+        "trial_num": "1",
+        "data_root": "/data"
+    },
+    "stages": {
+        "far_capture": {
+            "duration_s": 0.023,
+            "rgb_path": "/data/2026-03-09/1/images/harvest1_d405_1773075427.0251_far_rgb.jpg",
+            "depth_path": "/data/2026-03-09/1/images/harvest1_d405_1773075427.0251_far_depth.png"
+        },
+        "far_perception": {
+            "duration_s": 0.4098,
+            "num_detections": 0,
+            "num_pairs": 0,
+            "num_ripeness_results": 0,
+            "num_ripe": 0
+        }
+    },
+    "artifacts": {
+        "far_rgb": "/data/2026-03-09/1/images/harvest1_d405_1773075427.0251_far_rgb.jpg",
+        "far_depth": "/data/2026-03-09/1/images/harvest1_d405_1773075427.0251_far_depth.png",
+        "close_rgb": "/data/2026-03-09/1/images/harvest1_d405_1773075427.0251_close_rgb.jpg",
+        "close_depth": "/data/2026-03-09/1/images/harvest1_d405_1773075427.0251_close_depth.png",
+        "ann_stage1": "/data/2026-03-09/1/labelled_images/harvest1_d405_1773075427.0251_stage1_detections.jpg",
+        "ann_stage2": "/data/2026-03-09/1/labelled_images/harvest1_d405_1773075427.0251_stage2_pairs.jpg",
+        "ann_stage3": "/data/2026-03-09/1/labelled_images/harvest1_d405_1773075427.0251_stage3_ripeness.jpg",
+        "ann_stage5": "/data/2026-03-09/1/labelled_images/harvest1_d405_1773075427.0251_stage5_close_perception.jpg"
+    },
+    "status": "NO_RIPE_TARGET",
+    "message": "No ripe clusters detected.",
+    "end_time_utc": "2026-03-09_16-57-07 UTC",
+    "duration_s": 0.4337
+}

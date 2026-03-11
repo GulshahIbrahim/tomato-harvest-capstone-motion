@@ -1,0 +1,89 @@
+{
+    "run_id": 1,
+    "start_time_utc": "2026-03-09_17-28-58 UTC",
+    "config": {
+        "camera_frame": "tool_d405_camera_origin",
+        "standoff_m": 0.2,
+        "move_vel": 40,
+        "move_acc": 10,
+        "move_timeout_s": 30.0,
+        "trial_num": "1",
+        "data_root": "/data"
+    },
+    "stages": {
+        "far_capture": {
+            "duration_s": 0.0236,
+            "rgb_path": "/data/2026-03-09/1/images/harvest1_d405_1773077338.2228_far_rgb.jpg",
+            "depth_path": "/data/2026-03-09/1/images/harvest1_d405_1773077338.2228_far_depth.png"
+        },
+        "far_perception": {
+            "duration_s": 23.8537,
+            "num_detections": 2,
+            "num_pairs": 1,
+            "num_ripeness_results": 1,
+            "num_ripe": 1
+        },
+        "far_target": {
+            "bbox_center_uv": [
+                627.0,
+                399.0
+            ],
+            "depth_m": 0.20709999476821395,
+            "coarse_xyz_cam_m": [
+                -0.007088105360369861,
+                0.011326017940693902,
+                0.20709999476821395
+            ]
+        },
+        "robot_move": {
+            "duration_s": 3.3436,
+            "approach_xyz_cam_m": [
+                -0.007088105360369861,
+                0.011326017940693902,
+                0.007099994768213935
+            ],
+            "success": true
+        },
+        "close_capture": {
+            "duration_s": 0.0213,
+            "rgb_path": "/data/2026-03-09/1/images/harvest1_d405_1773077338.2228_close_rgb.jpg",
+            "depth_path": "/data/2026-03-09/1/images/harvest1_d405_1773077338.2228_close_depth.png"
+        },
+        "close_perception": {
+            "duration_s": 0.2628,
+            "detection_success": false,
+            "cluster_bbox": null,
+            "pedicel_bbox": null,
+            "cut_point": null,
+            "keypoints": [],
+            "debug_info": {
+                "failure_reason": "no_detections"
+            }
+        }
+    },
+    "artifacts": {
+        "far_rgb": "/data/2026-03-09/1/images/harvest1_d405_1773077338.2228_far_rgb.jpg",
+        "far_depth": "/data/2026-03-09/1/images/harvest1_d405_1773077338.2228_far_depth.png",
+        "close_rgb": "/data/2026-03-09/1/images/harvest1_d405_1773077338.2228_close_rgb.jpg",
+        "close_depth": "/data/2026-03-09/1/images/harvest1_d405_1773077338.2228_close_depth.png",
+        "ann_stage1": "/data/2026-03-09/1/labelled_images/harvest1_d405_1773077338.2228_stage1_detections.jpg",
+        "ann_stage2": "/data/2026-03-09/1/labelled_images/harvest1_d405_1773077338.2228_stage2_pairs.jpg",
+        "ann_stage3": "/data/2026-03-09/1/labelled_images/harvest1_d405_1773077338.2228_stage3_ripeness.jpg",
+        "ann_stage5": "/data/2026-03-09/1/labelled_images/harvest1_d405_1773077338.2228_stage5_close_perception.jpg"
+    },
+    "status": "CLOSE_DETECTION_FAILED",
+    "message": "Close perception failed to return a valid cutpoint.",
+    "end_time_utc": "2026-03-09_17-29-25 UTC",
+    "duration_s": 27.5066,
+    "cluster_bbox": [
+        349,
+        134,
+        905,
+        664
+    ],
+    "coarse_xyz_cam": [
+        -0.007088105360369861,
+        0.011326017940693902,
+        0.20709999476821395
+    ]
+}
