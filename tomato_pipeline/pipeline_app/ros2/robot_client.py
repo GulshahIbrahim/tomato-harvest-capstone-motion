@@ -5,7 +5,7 @@ from geometry_msgs.msg import PointStamped, QuaternionStamped
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from robot_interfaces.action import RobotJoints
-from robot_interfaces.srv import ComplexIK, GetTransform
+from robot_interfaces.srv import ComplexIK, GetTransform, SetRdo
 
 
 def create_position_message(position, frame_id):
@@ -43,14 +43,17 @@ class RobotClientROS2(Node):
         while not self.tf_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info("Waiting for get_transform service...")
 
+        self.set_rdo_client = self.create_client(SetRdo, "/set_rdo")
+        while not self.set_rdo_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Waiting for set_rdo service...")
+
         # Motion action
         self.joint_client = ActionClient(self, RobotJoints, "joint_controller")
         self.get_logger().info("Waiting for joint_controller action server...")
         self.joint_client.wait_for_server()
         self.get_logger().info("Connected to joint_controller.")
 
-    def get_current_frame_orientation(self, current_frame: str, target_frame: str = "base_link"):
-        """Query frame orientation in target_frame coordinates."""
+    def get_current_frame_transform(self, current_frame: str, target_frame: str = "base_link"):
         req = GetTransform.Request()
         req.current_frame = current_frame
         req.target_frame = target_frame
@@ -70,29 +73,33 @@ class RobotClientROS2(Node):
             self.get_logger().error(f"Failed to get transform {current_frame} -> {target_frame}")
             return None
 
-        quat = resp.transform.rotation
+        return resp.transform
+
+    def get_current_frame_orientation(self, current_frame: str, target_frame: str = "base_link"):
+        """Query frame orientation in target_frame coordinates."""
+        transform = self.get_current_frame_transform(current_frame, target_frame)
+        if transform is None:
+            return None
+
+        quat = transform.rotation
         return [quat.x, quat.y, quat.z, quat.w]
 
-    def move_xyz_cam_to_tool(
+    def move_pose(
         self,
-        xyz_cam,
-        camera_frame,
-        tool_frame="tcp",
+        position,
+        position_frame,
+        orientation_xyzw,
+        orientation_frame="base_link",
+        target_frame="tcp",
         velocity=40,
         acceleration=10,
         cnt_val=100,
         timeout_sec=30.0,
     ):
-        # Keep the target frame orientation fixed in base_link while moving in camera-relative XYZ.
-        quat_xyzw = self.get_current_frame_orientation(tool_frame, target_frame="base_link")
-        if quat_xyzw is None:
-            return False
-        self.get_logger().info(f"Using current {tool_frame} orientation in base_link: {quat_xyzw}")
-
         req = ComplexIK.Request()
-        req.target_frame = tool_frame
-        req.position = create_position_message(list(xyz_cam), camera_frame)
-        req.orientation = create_quaternion_message(quat_xyzw, "base_link")
+        req.target_frame = target_frame
+        req.position = create_position_message(list(position), position_frame)
+        req.orientation = create_quaternion_message(list(orientation_xyzw), orientation_frame)
 
         ik_future = self.complex_ik_client.call_async(req)
 
@@ -111,8 +118,6 @@ class RobotClientROS2(Node):
         if ik_resp is None or not ik_resp.success:
             self.get_logger().error("Complex IK failed")
             return False
-
-        self.get_logger().info("Complex IK succeeded")
 
         goal = RobotJoints.Goal()
         goal.joint_state = ik_resp.joint_state
@@ -155,3 +160,50 @@ class RobotClientROS2(Node):
         self.get_logger().info("Motion finished")
 
         return bool(result.success)
+
+    def move_xyz_cam_to_tool(
+        self,
+        xyz_cam,
+        camera_frame,
+        tool_frame="tcp",
+        velocity=40,
+        acceleration=10,
+        cnt_val=100,
+        timeout_sec=30.0,
+    ):
+        # Keep the target frame orientation fixed in base_link while moving in camera-relative XYZ.
+        quat_xyzw = self.get_current_frame_orientation(tool_frame, target_frame="base_link")
+        if quat_xyzw is None:
+            return False
+        self.get_logger().info(f"Using current {tool_frame} orientation in base_link: {quat_xyzw}")
+        return self.move_pose(
+            position=xyz_cam,
+            position_frame=camera_frame,
+            orientation_xyzw=quat_xyzw,
+            orientation_frame="base_link",
+            target_frame=tool_frame,
+            velocity=velocity,
+            acceleration=acceleration,
+            cnt_val=cnt_val,
+            timeout_sec=timeout_sec,
+        )
+
+    def set_rdo(self, num: int, data: bool, timeout_sec: float = 5.0) -> bool:
+        req = SetRdo.Request()
+        req.num = int(num)
+        req.data = bool(data)
+        future = self.set_rdo_client.call_async(req)
+
+        start = time.time()
+        while rclpy.ok() and not future.done():
+            if time.time() - start > timeout_sec:
+                self.get_logger().error(f"set_rdo timed out for RDO[{num}]")
+                return False
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        if future.exception() is not None:
+            self.get_logger().error(f"set_rdo raised: {future.exception()}")
+            return False
+
+        resp = future.result()
+        return bool(resp is not None and resp.success)

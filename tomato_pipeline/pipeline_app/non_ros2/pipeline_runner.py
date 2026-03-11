@@ -24,9 +24,11 @@ import numpy as np
 from pipeline_app.non_ros2.stages.stage1_far_detector import FarDetector, Detection
 from pipeline_app.non_ros2.stages.stage2_pairing import Pairer
 from pipeline_app.non_ros2.stages.stage3_ripeness import RipenessStage
-from pipeline_app.non_ros2.stages.stage5_close_robot import ClosePerceptionRobotStage
+from pipeline_app.non_ros2.stages.stage5_close_robot import ClosePerceptionRobotStage, CloseRobotOutput
+from pipeline_app.non_ros2.stages.stage6_actuation import Stage6Actuation
 from pipeline_app.non_ros2.vision.camera import Camera
 from pipeline_app.ros2.robot_client import RobotClientROS2
+from pipeline_app.ros2.tool_client import ToolClientROS2
 
 
 class PipelineRunStatus:
@@ -36,6 +38,11 @@ class PipelineRunStatus:
     MOTION_FAILED = "MOTION_FAILED"
     CLOSE_DETECTION_FAILED = "CLOSE_DETECTION_FAILED"
     INVALID_CUT_DEPTH = "INVALID_CUT_DEPTH"
+    ACTUATION_INVALID_DEPTH = "ACTUATION_INVALID_DEPTH"
+    ACTUATION_INVALID_ORIENTATION = "ACTUATION_INVALID_ORIENTATION"
+    GRASP_FAILED = "GRASP_FAILED"
+    CUT_FAILED = "CUT_FAILED"
+    DEPOSIT_FAILED = "DEPOSIT_FAILED"
 
 
 @dataclass(frozen=True)
@@ -119,6 +126,8 @@ class HarvestPipelineRunner:
         self.pairer = None
         self.ripeness = None
         self.close_stage = None
+        self.tool = None
+        self.actuation_stage = None
         self.run_counter = 0
 
         self.project_root = Path(__file__).resolve().parents[2]
@@ -151,6 +160,7 @@ class HarvestPipelineRunner:
 
             # Initialize heavy resources once.
             self.robot = RobotClientROS2()
+            self.tool = ToolClientROS2(self.robot, log=self.log)
             self.camera = Camera()
             self.detector = FarDetector(far_model)
             self.cluster_cls_name = "c"
@@ -168,6 +178,11 @@ class HarvestPipelineRunner:
             self.close_stage = ClosePerceptionRobotStage(
                 model_path=close_model,
                 imgsz=768,
+            )
+            self.actuation_stage = Stage6Actuation(
+                robot=self.robot,
+                tool=self.tool,
+                log=self.log,
             )
 
             self.log(f"[init] Using RealSense D405 serial: {self.camera.serial}")
@@ -399,6 +414,213 @@ class HarvestPipelineRunner:
             cv2.putText(out, "cut", (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
         return out
 
+    def _build_manual_close_output(
+        self,
+        cluster_bbox,
+        pedicel_bbox,
+        keypoints,
+        keypoint_confs=None,
+        base_debug_info=None,
+    ):
+        if keypoint_confs is None:
+            keypoint_confs = [1.0] * len(keypoints)
+        debug_info = dict(base_debug_info or {})
+        debug_info["manual_override"] = True
+        debug_info["manual_keypoint_count"] = len(keypoints)
+        return CloseRobotOutput(
+            cluster_bbox=cluster_bbox,
+            cluster_conf=1.0 if cluster_bbox is not None else 0.0,
+            pedicel_bbox=pedicel_bbox,
+            pedicel_conf=1.0 if pedicel_bbox is not None else 0.0,
+            keypoints=list(keypoints),
+            keypoint_confs=list(keypoint_confs),
+            cut_point=keypoints[0] if keypoints else None,
+            detection_success=bool(cluster_bbox is not None and pedicel_bbox is not None and keypoints),
+            debug_info=debug_info,
+        )
+
+    def _edit_close_perception(self, frame: np.ndarray, close_out) -> CloseRobotOutput:
+        self.log(
+            "[interactive] Close edit mode: drag a box then press 'c' for cluster or 'p' for pedicel. "
+            "Press 'k' then click to add up to 3 ordered keypoints. Press 'u' to undo the last keypoint, 'd' when done."
+        )
+
+        cluster_bbox = close_out.cluster_bbox
+        pedicel_bbox = close_out.pedicel_bbox
+        keypoints = list(close_out.keypoints)
+        keypoint_confs = list(close_out.keypoint_confs)
+
+        drawing = False
+        start_point = None
+        end_point = None
+        point_mode = False
+
+        def render():
+            temp_out = self._build_manual_close_output(
+                cluster_bbox=cluster_bbox,
+                pedicel_bbox=pedicel_bbox,
+                keypoints=keypoints,
+                keypoint_confs=keypoint_confs,
+                base_debug_info=close_out.debug_info,
+            )
+            rendered = self._annotate_stage5(frame, temp_out)
+            if drawing and start_point is not None and end_point is not None:
+                cv2.rectangle(rendered, start_point, end_point, (255, 0, 0), 2)
+            if point_mode:
+                cv2.putText(
+                    rendered,
+                    "click keypoint",
+                    (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            return rendered
+
+        temp_frame = render()
+
+        def mouse_callback(event, x, y, flags, param):
+            nonlocal drawing, start_point, end_point, temp_frame, point_mode, keypoints, keypoint_confs
+            if point_mode and event == cv2.EVENT_LBUTTONDOWN:
+                if len(keypoints) < 3:
+                    keypoints.append((float(x), float(y)))
+                    keypoint_confs.append(1.0)
+                    self.log(f"[interactive] Added keypoint k{len(keypoints) - 1}: {(x, y)}")
+                point_mode = False
+                temp_frame = render()
+                return
+
+            if event == cv2.EVENT_LBUTTONDOWN:
+                drawing = True
+                start_point = (x, y)
+                end_point = (x, y)
+            elif event == cv2.EVENT_MOUSEMOVE and drawing:
+                end_point = (x, y)
+                temp_frame = render()
+            elif event == cv2.EVENT_LBUTTONUP and drawing:
+                drawing = False
+                end_point = (x, y)
+                temp_frame = render()
+
+        cv2.namedWindow("Edit Close Perception")
+        cv2.setMouseCallback("Edit Close Perception", mouse_callback)
+
+        while True:
+            cv2.imshow("Edit Close Perception", temp_frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("c") and start_point and end_point:
+                x1, y1 = start_point
+                x2, y2 = end_point
+                cluster_bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+                self.log(f"[interactive] Updated close cluster bbox: {cluster_bbox}")
+                start_point = None
+                end_point = None
+                temp_frame = render()
+            elif key == ord("p") and start_point and end_point:
+                x1, y1 = start_point
+                x2, y2 = end_point
+                pedicel_bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+                self.log(f"[interactive] Updated close pedicel bbox: {pedicel_bbox}")
+                start_point = None
+                end_point = None
+                temp_frame = render()
+            elif key == ord("k"):
+                if len(keypoints) >= 3:
+                    self.log("[interactive] Already have 3 keypoints. Press 'u' to remove one before adding another.")
+                else:
+                    point_mode = True
+                    temp_frame = render()
+            elif key == ord("u"):
+                if keypoints:
+                    removed = keypoints.pop()
+                    if keypoint_confs:
+                        keypoint_confs.pop()
+                    self.log(f"[interactive] Removed keypoint: {removed}")
+                    temp_frame = render()
+            elif key == ord("d"):
+                break
+
+        cv2.destroyWindow("Edit Close Perception")
+        return self._build_manual_close_output(
+            cluster_bbox=cluster_bbox,
+            pedicel_bbox=pedicel_bbox,
+            keypoints=keypoints,
+            keypoint_confs=keypoint_confs,
+            base_debug_info=close_out.debug_info,
+        )
+
+    def _confirm_close_perception(self, frame: np.ndarray, close_out) -> tuple[bool, CloseRobotOutput]:
+        if not self.interactive:
+            return True, close_out
+
+        if not close_out.detection_success:
+            self.log("[interactive] Close perception did not produce a valid cutpoint. Opening manual edit mode.")
+            close_out = self._edit_close_perception(frame, close_out)
+
+        window_name = "Confirm Stage 5 Close Perception"
+        while True:
+            annotated = self._annotate_stage5(frame, close_out)
+            cv2.imshow(window_name, annotated)
+            self.log("[interactive] Confirm Stage 5 close perception. Press 'y' to proceed, 'n' to skip run, 'e' to edit.")
+            key = cv2.waitKey(0) & 0xFF
+            if key == ord("y"):
+                cv2.destroyWindow(window_name)
+                return True, close_out
+            if key == ord("n"):
+                cv2.destroyWindow(window_name)
+                return False, close_out
+            if key == ord("e"):
+                cv2.destroyWindow(window_name)
+                close_out = self._edit_close_perception(frame, close_out)
+
+    def _annotate_stage6(self, frame: np.ndarray, close_out, actuation_result):
+        out = self._annotate_stage5(frame, close_out)
+        for idx, point_xyz in enumerate(actuation_result.keypoints_xyz_cam):
+            cv2.putText(
+                out,
+                f"3d{idx}",
+                (15, 30 + idx * 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                out,
+                f"{point_xyz[0]:.3f},{point_xyz[1]:.3f},{point_xyz[2]:.3f}",
+                (65, 30 + idx * 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+        if close_out.keypoints and actuation_result.grasp_xyz_cam is not None:
+            if len(close_out.keypoints) >= 3:
+                grasp_uv = (
+                    0.5 * (close_out.keypoints[1][0] + close_out.keypoints[2][0]),
+                    0.5 * (close_out.keypoints[1][1] + close_out.keypoints[2][1]),
+                )
+            else:
+                grasp_uv = close_out.keypoints[-1]
+            gx, gy = int(grasp_uv[0]), int(grasp_uv[1])
+            cv2.circle(out, (gx, gy), 6, (255, 0, 255), -1)
+            cv2.putText(out, "grasp", (gx + 8, gy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(
+            out,
+            f"stage6: {actuation_result.status}",
+            (15, max(50, out.shape[0] - 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255) if actuation_result.success else (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return out
+
     def _prepare_output_paths(self, run_id: int, run_timestamp: float):
         cur_date = datetime.utcnow().strftime("%Y-%m-%d")
         parent_dir = self.data_root / cur_date / self.trial_num
@@ -421,6 +643,7 @@ class HarvestPipelineRunner:
             "ann_stage2": labelled_dir / f"{base}_stage2_pairs.jpg",
             "ann_stage3": labelled_dir / f"{base}_stage3_ripeness.jpg",
             "ann_stage5": labelled_dir / f"{base}_stage5_close_perception.jpg",
+            "ann_stage6": labelled_dir / f"{base}_stage6_actuation.jpg",
         }
 
     def _write_run_json(self, parent_dir: Path, run_id: int, run_payload: dict):
@@ -463,6 +686,7 @@ class HarvestPipelineRunner:
                 "ann_stage2": str(output_paths["ann_stage2"]),
                 "ann_stage3": str(output_paths["ann_stage3"]),
                 "ann_stage5": str(output_paths["ann_stage5"]),
+                "ann_stage6": str(output_paths["ann_stage6"]),
             },
         }
 
@@ -625,14 +849,25 @@ class HarvestPipelineRunner:
         # CLOSE PERCEPTION
         stage_t0 = time.time()
         close_out = self.close_stage.run(rgb_close)
+        proceed, close_out = self._confirm_close_perception(rgb_close, close_out)
+        if not proceed:
+            return _finalize(
+                PipelineRunStatus.CLOSE_DETECTION_FAILED,
+                "User rejected close perception result.",
+                cluster_bbox=chosen_target.cluster_bbox,
+                coarse_xyz_cam=coarse_xyz_cam,
+            )
         self._save_image(output_paths["ann_stage5"], self._annotate_stage5(rgb_close, close_out))
         run_payload["stages"]["close_perception"] = {
             "duration_s": round(time.time() - stage_t0, 4),
             "detection_success": bool(close_out.detection_success),
             "cluster_bbox": close_out.cluster_bbox,
+            "cluster_conf": close_out.cluster_conf,
             "pedicel_bbox": close_out.pedicel_bbox,
+            "pedicel_conf": close_out.pedicel_conf,
             "cut_point": close_out.cut_point,
             "keypoints": close_out.keypoints,
+            "keypoint_confs": close_out.keypoint_confs,
             "debug_info": close_out.debug_info,
         }
 
@@ -663,6 +898,43 @@ class HarvestPipelineRunner:
             "cut_xyz_cam_m": cut_xyz_cam,
         }
         self.log(f"[run {run_id}] Cutpoint XYZ_cam: {cut_xyz_cam}")
+
+        # STAGE 6 ACTUATION
+        stage_t0 = time.time()
+        actuation_result = self.actuation_stage.run(
+            depth_close,
+            close_out,
+            fx=self.fx,
+            fy=self.fy,
+            cx=self.cx,
+            cy=self.cy,
+            depth_scale=self.camera.depth_scale,
+            camera_frame=self.camera_frame,
+        )
+        run_payload["stages"]["actuation"] = {
+            "duration_s": round(time.time() - stage_t0, 4),
+            "success": bool(actuation_result.success),
+            "status": actuation_result.status,
+            "message": actuation_result.message,
+            "keypoints_xyz_cam": actuation_result.keypoints_xyz_cam,
+            "peduncle_axis_cam": actuation_result.peduncle_axis_cam,
+            "grasp_xyz_cam": actuation_result.grasp_xyz_cam,
+            "cut_xyz_cam": actuation_result.cut_xyz_cam,
+            "orientation_xyzw_base": actuation_result.orientation_xyzw_base,
+            "step_results": actuation_result.step_results,
+            "debug_info": actuation_result.debug_info,
+        }
+        self._save_image(output_paths["ann_stage6"], self._annotate_stage6(rgb_close, close_out, actuation_result))
+
+        if not actuation_result.success:
+            return _finalize(
+                actuation_result.status,
+                actuation_result.message,
+                cluster_bbox=chosen_target.cluster_bbox,
+                cut_point=close_out.cut_point,
+                coarse_xyz_cam=coarse_xyz_cam,
+                cut_xyz_cam=cut_xyz_cam,
+            )
 
         return _finalize(
             PipelineRunStatus.SUCCESS,
